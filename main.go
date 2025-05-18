@@ -40,25 +40,26 @@ func (w *AppendWriter) Close() error {
 
 func main() {
 	var (
-		device                  = flag.String("device", "", "块设备或镜像文件路径（必需）")
-		sectorDir               = flag.String("sector-dir", "", "CopyOnWrite扇区文件目录（必需）")
-		listenAddr              = flag.String("listen", ":10809", "监听地址，格式如 :10809")
-		sectorSize              = flag.Int64("sector-size", 4096, "扇区大小（必须是 512 的 2 次方倍数）")
-		logFile                 = flag.String("log", "", "日志文件路径（可选，默认输出到标准错误）")
-		filterSize              = flag.Uint("filter-size", 100000, "布隆过滤器预计元素数量")
-		filterFalsePositiveRate = flag.Float64("filter-fpr", 0.01, "布隆过滤器错误率（0-1之间）")
-		cacheSize               = flag.Int("cache-size", 5000, "LRU缓存大小（缓存的扇区数量）")
-		enablePrefetch          = flag.Bool("enable-prefetch", false, "是否启用预读取缓存")
-		prefetchMultiplier      = flag.Int("prefetch-multiplier", 16, "预读取倍数（相对于扇区大小）")
+		device                  = flag.String("device", "", "Block device or image file path (required)")
+		sectorDir               = flag.String("sector-dir", "", "CopyOnWrite sector file directory (required)")
+		listenAddr              = flag.String("listen", ":10809", "Listen address, format like :10809")
+		sectorSize              = flag.Int64("sector-size", 4096, "Sector size (must be a multiple of 512 and power of 2)")
+		logFile                 = flag.String("log", "", "Log file path (optional, default to stderr)")
+		filterSize              = flag.Uint("filter-size", 100000, "Bloom filter estimated element count")
+		filterFalsePositiveRate = flag.Float64("filter-fpr", 0.01, "Bloom filter false positive rate (0-1)")
+		cacheSize               = flag.Int("cache-size", 5000, "LRU cache size (number of sectors to cache)")
+		enablePrefetch          = flag.Bool("enable-prefetch", false, "Enable prefetch cache")
+		prefetchMultiplier      = flag.Int("prefetch-multiplier", 16, "Prefetch multiplier (relative to sector size)")
+		maxConsecutiveReads     = flag.Int("max-consecutive-reads", 2, "Maximum consecutive reads before prefetch (default 2)")
 	)
 	flag.Parse()
 
 	// 检查必需参数
 	if *device == "" {
-		log.Fatal("必须指定块设备或镜像文件路径（-device）")
+		log.Fatal("Block device or image file path is required (-device)")
 	}
 	if *sectorDir == "" {
-		log.Fatal("必须指定扇区文件目录（-sector-dir）")
+		log.Fatal("Sector file directory is required (-sector-dir)")
 	}
 
 	// 设置日志输出
@@ -71,7 +72,7 @@ func main() {
 	// 检查设备类型
 	fi, err := os.Stat(*device)
 	if err != nil {
-		log.Fatalf("设备或文件不存在: %v", err)
+		log.Fatalf("Device or file does not exist: %v", err)
 	}
 
 	// 创建基础后端
@@ -80,7 +81,7 @@ func main() {
 		// 块设备
 		devBackend, err := nbdbackend.NewDeviceBackend(*device)
 		if err != nil {
-			log.Fatalf("创建块设备后端失败: %v", err)
+			log.Fatalf("Failed to create block device backend: %v", err)
 		}
 		defer devBackend.Close()
 		baseBackend = devBackend
@@ -88,7 +89,7 @@ func main() {
 		// 普通文件
 		f, err := os.OpenFile(*device, os.O_RDWR, 0666)
 		if err != nil {
-			log.Fatalf("打开文件失败: %v", err)
+			log.Fatalf("Failed to open file: %v", err)
 		}
 		defer f.Close()
 		baseBackend = backend.NewFileBackend(f)
@@ -97,15 +98,15 @@ func main() {
 	// 创建 COW 后端
 	cowBackend, err := nbdbackend.NewCowBackend(baseBackend, *sectorDir, *sectorSize, *filterSize, *filterFalsePositiveRate, *cacheSize)
 	if err != nil {
-		log.Fatalf("创建 COW 后端失败: %v", err)
+		log.Fatalf("Failed to create COW backend: %v", err)
 	}
 
 	// 如果启用预读取缓存，创建预读取后端
 	var backend backend.Backend = cowBackend
 	if *enablePrefetch {
-		prefetchBackend, err := nbdbackend.NewPrefetchBackend(cowBackend, *sectorSize, *prefetchMultiplier)
+		prefetchBackend, err := nbdbackend.NewPrefetchBackend(cowBackend, *sectorSize, *prefetchMultiplier, *maxConsecutiveReads)
 		if err != nil {
-			log.Fatalf("创建预读取缓存后端失败: %v", err)
+			log.Fatalf("Failed to create prefetch cache backend: %v", err)
 		}
 		backend = prefetchBackend
 	}
@@ -115,9 +116,9 @@ func main() {
 
 	ln, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
-		log.Fatalf("监听失败: %v", err)
+		log.Fatalf("Failed to listen: %v", err)
 	}
-	fmt.Printf("NBD 服务器已启动，监听 %s\n", *listenAddr)
+	fmt.Printf("NBD server started, listening on %s\n", *listenAddr)
 
 	// 优雅退出
 	quit := make(chan os.Signal, 1)
@@ -125,7 +126,7 @@ func main() {
 
 	go func() {
 		<-quit
-		fmt.Println("\n收到退出信号，关闭服务器...")
+		fmt.Println("\nReceived exit signal, shutting down server...")
 		ln.Close()
 		os.Exit(0)
 	}()
@@ -133,7 +134,7 @@ func main() {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("Accept 失败: %v", err)
+			log.Printf("Accept failed: %v", err)
 			break
 		}
 		go func(c net.Conn) {
@@ -150,7 +151,7 @@ func main() {
 				},
 			)
 			if err != nil {
-				log.Printf("NBD 处理失败: %v", err)
+				log.Printf("NBD handling failed: %v", err)
 			}
 		}(conn)
 	}

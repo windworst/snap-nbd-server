@@ -17,7 +17,7 @@ type CowBackend struct {
 	dir        string
 	sectorSize int64
 	filter     *bloom.BloomFilter
-	cache      *lru.Cache // LRU缓存
+	cache      *lru.Cache // LRU cache
 }
 
 func NewCowBackend(base backend.Backend, dir string, sectorSize int64, filterSize uint, filterFalsePositiveRate float64, cacheSize int) (*CowBackend, error) {
@@ -26,16 +26,16 @@ func NewCowBackend(base backend.Backend, dir string, sectorSize int64, filterSiz
 		return nil, fmt.Errorf("sector size must be a multiple of 512 and a power of 2")
 	}
 
-	// 创建布隆过滤器，使用命令行传入的参数
+	// Create bloom filter using command line parameters
 	filter := bloom.NewWithEstimates(filterSize, filterFalsePositiveRate)
 
-	// 创建LRU缓存，大小使用传入的参数
+	// Create LRU cache with the specified size
 	cache, err := lru.New(cacheSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LRU cache: %v", err)
 	}
 
-	// 初始化CowBackend实例
+	// Initialize CowBackend instance
 	cowBackend := &CowBackend{
 		base:       base,
 		dir:        dir,
@@ -44,7 +44,7 @@ func NewCowBackend(base backend.Backend, dir string, sectorSize int64, filterSiz
 		cache:      cache,
 	}
 
-	// 扫描现有的扇区文件，将其添加到布隆过滤器
+	// Scan existing sector files and add them to the bloom filter
 	if err := cowBackend.scanExistingSectors(); err != nil {
 		return nil, fmt.Errorf("failed to scan existing sectors: %v", err)
 	}
@@ -52,49 +52,106 @@ func NewCowBackend(base backend.Backend, dir string, sectorSize int64, filterSiz
 	return cowBackend, nil
 }
 
-// sectorToBytes 将扇区号转换为字节数组，用于布隆过滤器
+// sectorToBytes converts a sector number to a byte array for bloom filter
 func (b *CowBackend) sectorToBytes(sector int64) []byte {
 	key := make([]byte, 8)
 	binary.LittleEndian.PutUint64(key, uint64(sector))
 	return key
 }
 
-// sectorToCacheKey 将扇区号转换为缓存键
+// sectorToCacheKey converts a sector number to a cache key
 func (b *CowBackend) sectorToCacheKey(sector int64) uint64 {
 	return uint64(sector)
 }
 
-// 扫描现有扇区文件并将其添加到布隆过滤器
+// Scan existing sector files and add them to the bloom filter
 func (b *CowBackend) scanExistingSectors() error {
-	// 确保目录存在
+	fmt.Printf("Starting to scan sector files directory: %s\n", b.dir)
+
+	// Ensure directory exists
 	if _, err := os.Stat(b.dir); os.IsNotExist(err) {
-		return nil // 目录不存在，不需要扫描
+		fmt.Println("Directory does not exist, no need to scan")
+		return nil // Directory does not exist, no need to scan
 	}
 
-	// 遍历目录
-	return filepath.Walk(b.dir, func(path string, info os.FileInfo, err error) error {
+	count := 0
+	dirCounts := make(map[string]int)
+	// Use custom method to scan all .sector files
+	err := b.walkAllSectorFiles(b.dir, &count, dirCounts)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Scan completed, loaded %d sectors in total\n", count)
+	return err
+}
+
+// walkAllSectorFiles recursively scans directories and processes all .sector files
+func (b *CowBackend) walkAllSectorFiles(dir string, count *int, dirCounts map[string]int) error {
+	// Read directory contents
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+
+		// If it's a directory, process recursively
+		if entry.IsDir() {
+			if err := b.walkAllSectorFiles(path, count, dirCounts); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Get detailed info
+		info, err := entry.Info()
 		if err != nil {
-			return err
+			continue
 		}
 
-		// 只处理文件
-		if info.IsDir() {
-			return nil
+		// Handle symbolic links
+		if info.Mode()&os.ModeSymlink != 0 {
+			realPath, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				continue
+			}
+
+			realInfo, err := os.Stat(realPath)
+			if err != nil {
+				continue
+			}
+
+			// If it points to a directory, process recursively
+			if realInfo.IsDir() {
+				if err := b.walkAllSectorFiles(realPath, count, dirCounts); err != nil {
+					return err
+				}
+				continue
+			}
+
+			path = realPath // Use the actual path for further processing
 		}
 
-		// 检查是否是扇区文件
+		// Check if it's a sector file
 		if filepath.Ext(path) == ".sector" {
-			// 从文件名中提取扇区号
+			// Extract sector number from filename
 			filename := filepath.Base(path)
 			var sector int64
-			_, err := fmt.Sscanf(filename, "%016x", &sector)
+			var sectorSize int64
+			_, err := fmt.Sscanf(filename, "%016x_%08x.sector", &sector, &sectorSize)
 			if err == nil {
-				// 将扇区添加到布隆过滤器
+				// Add sector to bloom filter
 				b.filter.Add(b.sectorToBytes(sector))
+				*count++
+				// Update directory statistics
+				dirCounts[filepath.Dir(path)]++
 			}
 		}
-		return nil
-	})
+	}
+
+	return nil
 }
 
 func (b *CowBackend) sectorPath(sector int64) string {
@@ -108,76 +165,92 @@ func (b *CowBackend) sectorPath(sector int64) string {
 	return filepath.Join(append([]string{b.dir}, append(dirs, filename)...)...)
 }
 
+// readBlackSectorToBuffer reads black sector data directly into the target buffer
+func (b *CowBackend) readBlackSectorToBuffer(sector int64, targetBuf []byte, sectorOffset int64) bool {
+	// Try to get data from cache
+	cacheKey := b.sectorToCacheKey(sector)
+	if cachedData, ok := b.cache.Get(cacheKey); ok {
+		// Copy data from cache directly to target buffer
+		sectorData := cachedData.([]byte)
+		copy(targetBuf, sectorData[sectorOffset:sectorOffset+int64(len(targetBuf))])
+		return true
+	}
+
+	// Cache miss, try to read from file
+	sectorFile := b.sectorPath(sector)
+	f, err := os.OpenFile(sectorFile, os.O_RDONLY, 0666)
+	if err != nil {
+		return false // File open failed
+	}
+
+	// Read directly into target buffer
+	_, err = f.ReadAt(targetBuf, sectorOffset)
+	if err != nil && err != io.EOF {
+		f.Close()
+		return false // File read failed
+	}
+
+	// After successful read, add the entire sector to cache
+	if b.cache != nil {
+		sectorData := make([]byte, b.sectorSize)
+		f.Seek(0, io.SeekStart)
+		_, err = f.ReadAt(sectorData, 0)
+		if err == nil || err == io.EOF {
+			b.cache.Add(cacheKey, sectorData)
+		}
+	}
+
+	f.Close()
+	return true
+}
+
 func (b *CowBackend) ReadAt(p []byte, off int64) (n int, err error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
 
-	// 计算起始扇区和结束扇区
+	// 1. First read all requested data from the base device
+	n, err = b.base.ReadAt(p, off)
+	if err != nil && err != io.EOF {
+		return n, err
+	}
+
+	// If the read data length is insufficient, return EOF
+	if int64(n) < int64(len(p)) {
+		err = io.EOF
+	} else {
+		err = nil
+	}
+
+	// 2. Calculate the sector range to process
 	startSector := off / b.sectorSize
 	endSector := (off + int64(len(p)) - 1) / b.sectorSize
 
-	// 处理读取
-	remaining := p
-	currentOff := off
-
+	// 3. Check each sector and overlay black sector data
 	for sector := startSector; sector <= endSector; sector++ {
-		// 计算当前扇区需要读取的数据长度
-		sectorStart := int(currentOff % b.sectorSize)
-		sectorRemaining := int(b.sectorSize) - sectorStart
-		readLen := min(sectorRemaining, len(remaining))
+		// Use bloom filter to quickly check if this sector has been modified
+		if b.filter.Test(b.sectorToBytes(sector)) {
+			// Calculate the start position and length of this sector in the request range
+			sectorStartOffset := sector * b.sectorSize
+			sectorEndOffset := sectorStartOffset + b.sectorSize - 1
 
-		// 读取当前扇区
-		n, err = b.readSector(remaining[:readLen], currentOff, sector)
-		if err != nil && err != io.EOF {
-			return len(p) - len(remaining), err
-		}
-		if n > 0 {
-			remaining = remaining[n:]
-			currentOff += int64(n)
-		}
-		if err == io.EOF {
-			break
+			// Calculate the intersection with the current request
+			readStart := max(sectorStartOffset, off)
+			readEnd := min(sectorEndOffset, off+int64(len(p))-1)
+
+			if readStart <= readEnd {
+				// Calculate the offset within the sector and in the buffer
+				sectorOffset := readStart - sectorStartOffset
+				bufOffset := readStart - off
+				length := readEnd - readStart + 1
+
+				// Read black sector data and overlay to the corresponding position in the buffer
+				b.readBlackSectorToBuffer(sector, p[bufOffset:bufOffset+length], sectorOffset)
+			}
 		}
 	}
 
-	return len(p) - len(remaining), nil
-}
-
-func (b *CowBackend) readSector(p []byte, off int64, sector int64) (n int, err error) {
-	// 使用布隆过滤器快速检查此扇区是否已被修改
-	if !b.filter.Test(b.sectorToBytes(sector)) {
-		// 扇区未被修改，直接从原始文件读取
-		return b.base.ReadAt(p, off)
-	}
-
-	// 从缓存读取数据（如果有的话）
-	inSectorOffset := off % b.sectorSize
-	cacheKey := b.sectorToCacheKey(sector)
-	if cachedData, ok := b.cache.Get(cacheKey); ok {
-		// 缓存命中，从缓存读取
-		sectorData := cachedData.([]byte)
-		copy(p, sectorData[inSectorOffset:inSectorOffset+int64(len(p))])
-		return len(p), nil
-	}
-
-	// 缓存未命中，从文件读取
-	sectorFile := b.sectorPath(sector)
-
-	// 尝试打开扇区文件
-	f, err := os.OpenFile(sectorFile, os.O_RDONLY, 0666)
-	if err == nil {
-		defer f.Close()
-		// 扇区文件存在，直接从文件读取所需部分
-		_, err = f.Seek(inSectorOffset, io.SeekStart)
-		if err != nil {
-			return 0, err
-		}
-		return f.Read(p)
-	}
-
-	// 如果布隆过滤器误报（扇区文件实际不存在），从原始文件读取
-	return b.base.ReadAt(p, off)
+	return n, err
 }
 
 func (b *CowBackend) WriteAt(p []byte, off int64) (n int, err error) {
@@ -185,21 +258,21 @@ func (b *CowBackend) WriteAt(p []byte, off int64) (n int, err error) {
 		return 0, nil
 	}
 
-	// 计算起始扇区和结束扇区
+	// Calculate start sector and end sector
 	startSector := off / b.sectorSize
 	endSector := (off + int64(len(p)) - 1) / b.sectorSize
 
-	// 处理写入
+	// Process write
 	remaining := p
 	currentOff := off
 
 	for sector := startSector; sector <= endSector; sector++ {
-		// 计算当前扇区需要写入的数据长度
+		// Calculate current sector data length to write
 		sectorStart := int(currentOff % b.sectorSize)
 		sectorRemaining := int(b.sectorSize) - sectorStart
 		writeLen := min(sectorRemaining, len(remaining))
 
-		// 写入当前扇区
+		// Write current sector
 		n, err = b.writeSector(remaining[:writeLen], currentOff, sector)
 		if err != nil {
 			return len(p) - len(remaining), err
@@ -217,42 +290,42 @@ func (b *CowBackend) writeSector(p []byte, off int64, sector int64) (n int, err 
 	sectorFile := b.sectorPath(sector)
 	cacheKey := b.sectorToCacheKey(sector)
 
-	// 写入前确保目录存在
+	// Write before ensuring directory exists
 	dir := filepath.Dir(sectorFile)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return 0, fmt.Errorf("failed to create sector directory: %v", err)
 	}
 
-	// 将扇区添加到布隆过滤器
+	// Add sector to bloom filter
 	b.filter.Add(b.sectorToBytes(sector))
 
-	// 准备扇区数据
+	// Prepare sector data
 	var sectorData []byte
 	inSectorOffset := off % b.sectorSize
 
-	// 检查扇区文件是否存在
+	// Check if sector file exists
 	_, err = os.Stat(sectorFile)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return 0, err
 		}
 
-		// 扇区文件不存在，在内存中准备数据
+		// Sector file does not exist, prepare data in memory
 		sectorData = make([]byte, b.sectorSize)
 
-		// 尝试从缓存获取
+		// Try to get data from cache
 		if cachedData, ok := b.cache.Get(cacheKey); ok {
-			// 从缓存复制数据
+			// Copy data from cache
 			copy(sectorData, cachedData.([]byte))
 		} else {
-			// 从原始文件读取
+			// Read from original file
 			_, err = b.base.ReadAt(sectorData, sector*b.sectorSize)
 			if err != nil && err != io.EOF {
 				return 0, err
 			}
 		}
 	} else {
-		// 扇区文件存在，读取现有数据
+		// Sector file exists, read existing data
 		sectorData = make([]byte, b.sectorSize)
 		f, err := os.OpenFile(sectorFile, os.O_RDONLY, 0666)
 		if err != nil {
@@ -265,13 +338,13 @@ func (b *CowBackend) writeSector(p []byte, off int64, sector int64) (n int, err 
 		}
 	}
 
-	// 在内存中写入新数据
+	// Write new data into memory
 	copy(sectorData[inSectorOffset:], p)
 
-	// 更新缓存
+	// Update cache
 	b.cache.Add(cacheKey, sectorData)
 
-	// 一次性写入文件
+	// Write once into file
 	err = os.WriteFile(sectorFile, sectorData, 0666)
 	if err != nil {
 		return 0, err
