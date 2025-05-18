@@ -47,6 +47,7 @@ func main() {
 		logFile                 = flag.String("log", "", "日志文件路径（可选，默认输出到标准错误）")
 		filterSize              = flag.Uint("filter-size", 100000, "布隆过滤器预计元素数量")
 		filterFalsePositiveRate = flag.Float64("filter-fpr", 0.01, "布隆过滤器错误率（0-1之间）")
+		cacheSize               = flag.Int("cache-size", 5000, "LRU缓存大小（缓存的扇区数量）")
 	)
 	flag.Parse()
 
@@ -92,7 +93,7 @@ func main() {
 	}
 
 	// 创建 COW 后端
-	cowBackend, err := nbdbackend.NewCowBackend(baseBackend, *sectorDir, *sectorSize, *filterSize, *filterFalsePositiveRate)
+	cowBackend, err := nbdbackend.NewCowBackend(baseBackend, *sectorDir, *sectorSize, *filterSize, *filterFalsePositiveRate, *cacheSize)
 	if err != nil {
 		log.Fatalf("创建 COW 后端失败: %v", err)
 	}
