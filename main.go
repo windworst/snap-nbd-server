@@ -48,6 +48,8 @@ func main() {
 		filterSize              = flag.Uint("filter-size", 100000, "布隆过滤器预计元素数量")
 		filterFalsePositiveRate = flag.Float64("filter-fpr", 0.01, "布隆过滤器错误率（0-1之间）")
 		cacheSize               = flag.Int("cache-size", 5000, "LRU缓存大小（缓存的扇区数量）")
+		enablePrefetch          = flag.Bool("enable-prefetch", false, "是否启用预读取缓存")
+		prefetchMultiplier      = flag.Int("prefetch-multiplier", 16, "预读取倍数（相对于扇区大小）")
 	)
 	flag.Parse()
 
@@ -98,8 +100,18 @@ func main() {
 		log.Fatalf("创建 COW 后端失败: %v", err)
 	}
 
+	// 如果启用预读取缓存，创建预读取后端
+	var backend backend.Backend = cowBackend
+	if *enablePrefetch {
+		prefetchBackend, err := nbdbackend.NewPrefetchBackend(cowBackend, *sectorSize, *prefetchMultiplier)
+		if err != nil {
+			log.Fatalf("创建预读取缓存后端失败: %v", err)
+		}
+		backend = prefetchBackend
+	}
+
 	// 创建日志后端
-	logBackend := nbdbackend.NewLogBackend(cowBackend, logger)
+	logBackend := nbdbackend.NewLogBackend(backend, logger)
 
 	ln, err := net.Listen("tcp", *listenAddr)
 	if err != nil {

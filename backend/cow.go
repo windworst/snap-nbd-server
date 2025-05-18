@@ -285,11 +285,5 @@ func (b *CowBackend) Size() (int64, error) {
 }
 
 func (b *CowBackend) Sync() error {
-	// 不需要特别的同步操作，因为每次操作都是直接打开文件
-	return nil
-}
-
-func (b *CowBackend) Close() error {
-	// 不需要特别的关闭操作，因为每次操作都是直接打开文件
-	return nil
+	return b.base.Sync()
 }
