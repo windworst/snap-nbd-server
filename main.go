@@ -50,7 +50,7 @@ func main() {
 		cacheSize               = flag.Int("cache-size", 5000, "LRU cache size (number of sectors to cache)")
 		enablePrefetch          = flag.Bool("enable-prefetch", false, "Enable prefetch cache")
 		prefetchMultiplier      = flag.Int("prefetch-multiplier", 16, "Prefetch multiplier (relative to sector size)")
-		maxConsecutiveReads     = flag.Int("max-consecutive-reads", 2, "Maximum consecutive reads before prefetch (default 2)")
+		maxConsecutiveReads     = flag.Int("max-consecutive-reads", 4, "Maximum consecutive reads before prefetch")
 	)
 	flag.Parse()
 
