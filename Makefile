@@ -6,7 +6,7 @@ GOFLAGS=-v -buildvcs=false
 LDFLAGS=-w -s
 
 # 目标程序
-SERVER=snap-nbd-server.exe
+SERVER=snap-nbd.exe
 
 all: server
 
